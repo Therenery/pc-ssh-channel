@@ -1,0 +1,11 @@
+#!/bin/sh
+# open-url —— 在 Android 宿主上用默认浏览器打开一个 URL（可选组件）
+#
+# 依赖 Termux 的 termux-am（am 命令）。proot 容器内可直接调用。
+# 关键：--user 0，否则 Android 会以 user -2 报 INTERACT_ACROSS_USERS 权限错误。
+if [ -z "$1" ]; then
+  echo "usage: open-url <url>"
+  exit 1
+fi
+exec /data/data/com.termux/files/usr/bin/am start --user 0 \
+  -a android.intent.action.VIEW -d "$1"

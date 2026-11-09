@@ -1,0 +1,26 @@
+#!/bin/sh
+# pcshot —— 把电脑上的图片缩放成 JPEG 取回本机
+#
+# 用法：pcshot <电脑上的图片路径> <本地输出.jpg> [宽度]
+# 例：  pcshot "C:\Users\me\Pictures\shot.png" /tmp/shot.jpg 900
+set -e
+CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
+[ -r "$CONF" ] && . "$CONF"
+SRC="$1"; OUT="${2:-${PC_INBOX:-$HOME/inbox}/shot.jpg}"; W="${3:-900}"
+[ -n "$SRC" ] || { echo "用法: pcshot <远程图片> <本地输出.jpg> [宽度]" >&2; exit 64; }
+
+PS="Add-Type -AssemblyName System.Drawing; \$img=[System.Drawing.Image]::FromFile('$SRC'); \$w=$W; \$h=[int](\$img.Height*\$w/\$img.Width); \$bmp=New-Object System.Drawing.Bitmap \$w,\$h; \$g=[System.Drawing.Graphics]::FromImage(\$bmp); \$g.InterpolationMode='HighQualityBicubic'; \$g.DrawImage(\$img,0,0,\$w,\$h); \$ms=New-Object System.IO.MemoryStream; \$bmp.Save(\$ms,[System.Drawing.Imaging.ImageFormat]::Jpeg); [Convert]::ToBase64String(\$ms.ToArray())"
+B64=$(pc "$PS" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | tr -d '\n')
+LEN=$(printf %s "$B64" | wc -c)
+echo "b64len=$LEN" >&2
+: > /tmp/_shot.b64
+I=0
+while [ $I -lt $LEN ]; do
+  END=$((I+18000))
+  CH=$(pc "\$s='$B64'; \$s.Substring($I,[Math]::Min(18000,\$s.Length-$I))" 2>/dev/null | grep -oE '[A-Za-z0-9+/=]{20,}' | tr -d '\n')
+  printf %s "$CH" >> /tmp/_shot.b64
+  I=$END
+done
+mkdir -p "$(dirname "$OUT")"
+base64 -d /tmp/_shot.b64 > "$OUT"
+echo "$OUT $(wc -c < "$OUT")"

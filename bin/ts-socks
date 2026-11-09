@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+# ts-socks —— SSH ProxyCommand：经 tailscaled 的 SOCKS5 出口连 tailnet 地址
+#
+# 用法：ssh -o "ProxyCommand=ts-socks %h %p"
+#
+# 相比 tsnc，这条路不依赖 tailscaled 的 unix socket 文件，只要 daemon 的
+# SOCKS 监听还在就能用。
+import os
+import socket
+import struct
+import sys
+import threading
+
+SOCKS_HOST = os.environ.get("PC_TS_SOCKS_HOST", "127.0.0.1")
+SOCKS_PORT = int(os.environ.get("PC_TS_SOCKS_PORT", "1066"))
+
+
+def fail(msg):
+    sys.stderr.write("ts-socks: %s\n" % msg)
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 3:
+        fail("用法: ts-socks <host> <port>")
+    host = sys.argv[1]
+    try:
+        port = int(sys.argv[2])
+    except ValueError:
+        fail("端口不合法: %s" % sys.argv[2])
+
+    try:
+        s = socket.create_connection((SOCKS_HOST, SOCKS_PORT), timeout=10)
+    except OSError as e:
+        fail("连不上 SOCKS 出口: %s" % e)
+
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        fail("SOCKS 握手失败")
+
+    try:
+        addr = b"\x01" + socket.inet_aton(host)
+    except OSError:
+        hb = host.encode()
+        addr = b"\x03" + bytes([len(hb)]) + hb
+    s.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
+
+    r = s.recv(4)
+    if len(r) < 4 or r[1] != 0:
+        fail("SOCKS 连接被拒 (code=%s)" % (r[1] if len(r) > 1 else "?"))
+
+    atyp = r[3]
+    if atyp == 1:
+        s.recv(6)
+    elif atyp == 3:
+        n = s.recv(1)[0]
+        s.recv(n + 2)
+    elif atyp == 4:
+        s.recv(18)
+
+    def pump_in():
+        try:
+            while True:
+                d = os.read(0, 65536)
+                if not d:
+                    break
+                s.sendall(d)
+        except OSError:
+            pass
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    threading.Thread(target=pump_in, daemon=True).start()
+
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            os.write(1, d)
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

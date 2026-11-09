@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# pcget —— 从电脑(Windows)取一个文件到本机，并用手机浏览器打开下载
+#
+# 用法：pcget "F:\path\to\file.ext"
+#   1) 交给 pc --scp 拉文件（自动选路 + tailscale 自愈，落 PC_INBOX）
+#   2) 在本机起 HTTP 服务托管 PC_INBOX
+#   3) open-url 弹出浏览器 → 点一下即下载到手机存储
+#
+# 没有 open-url（非 Termux 环境）时只打印本地路径。
+set -u
+p="${1:-}"
+[ -z "$p" ] && { echo '用法: pcget "电脑上的完整路径"'; exit 1; }
+
+CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
+[ -r "$CONF" ] && . "$CONF"
+INBOX="${PC_INBOX:-$HOME/inbox}"
+PORT="${PC_HTTP_PORT:-8099}"
+
+err=$(mktemp)
+lp=$(pc --scp "$p" 2>"$err")
+rc=$?
+if [ "$rc" -ne 0 ] || [ ! -f "$lp" ]; then
+  echo "拉取失败：$p"
+  sed 's/^/  /' "$err" | head -5
+  rm -f "$err"
+  exit 1
+fi
+rm -f "$err"
+name=$(basename "$lp")
+
+if ! command -v open-url >/dev/null 2>&1; then
+  echo "已拉到: $lp"
+  exit 0
+fi
+
+# 确保本地 HTTP 服务在跑（setsid 完全脱离，避免调用方等它）
+if ! curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/"; then
+  setsid python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$INBOX" \
+    </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  sleep 1.5
+fi
+url="http://127.0.0.1:$PORT/$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$name")"
+echo "已拉到: $lp"
+open-url "$url"
+echo "已在手机浏览器打开，点下载即可存到手机: $url"

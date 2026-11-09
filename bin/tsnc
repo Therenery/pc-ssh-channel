@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# tsnc —— 把 host port 转给容器内 tailscaled 的 `tailscale nc`，
+# 供 ssh 的 ProxyCommand 使用。
+#
+# 环境变量（pc 会自动导出）:
+#   PC_TS_BASE  tailscale 安装目录
+#   TS_SOCK     tailscaled 的 unix socket
+set -u
+BASE="${PC_TS_BASE:-$HOME/.local/tailscale}"
+SOCK="${TS_SOCK:-$BASE/run/tailscaled.sock}"
+exec "$BASE/tailscale" --socket="$SOCK" nc "$@"

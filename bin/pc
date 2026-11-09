@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# pc —— 一条命令连上 Windows 电脑
+#
+# 多路由并行探测 + 路由缓存 + 断线换路 + tailscaled 自愈。
+#
+# 用法:
+#   pc "命令"                          在电脑上执行一条命令
+#   pc                                 开交互 shell
+#   pc --scp "F:\路径\文件" [本地路径]  把电脑上的文件拉到本机
+#
+# 调试: PC_DEBUG=1 pc ...
+set -u
+
+CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
+[ -r "$CONF" ] && . "$CONF"
+
+PC_USER="${PC_USER:-}"
+PC_TS_IP="${PC_TS_IP:-}"
+PC_V6_HOST="${PC_V6_HOST:-}"
+PC_V6_PREFIX="${PC_V6_PREFIX:-}"
+PC_PORT="${PC_PORT:-22}"
+PC_TS_BASE="${PC_TS_BASE:-$HOME/.local/tailscale}"
+PC_TS_HOSTNAME="${PC_TS_HOSTNAME:-android-proot}"
+PC_TS_SOCKS_HOST="${PC_TS_SOCKS_HOST:-127.0.0.1}"
+PC_TS_SOCKS_PORT="${PC_TS_SOCKS_PORT:-1066}"
+PC_CACHE="${PC_CACHE:-${TMPDIR:-/tmp}/.pc-route}"
+
+TS_SOCK="$PC_TS_BASE/run/tailscaled.sock"
+
+if [ -z "$PC_USER" ]; then
+  echo "pc: 缺少 PC_USER，请在 $CONF 里配置（参考 config/pc.conf.example）" >&2
+  exit 78
+fi
+if [ -z "$PC_TS_IP" ] && [ -z "$PC_V6_HOST" ]; then
+  echo "pc: PC_TS_IP 与 PC_V6_HOST 至少填一个" >&2
+  exit 78
+fi
+
+# ProxyCommand 子进程靠这些环境变量找 tailscale
+export PC_TS_BASE TS_SOCK PC_TS_SOCKS_HOST PC_TS_SOCKS_PORT
+
+SSHOPTS=(-o StrictHostKeyChecking=accept-new
+         -o ServerAliveInterval=5
+         -o ServerAliveCountMax=6)
+PROBE_TIMEOUT=15    # 单条探针总上限（秒）；移动网络下 8 秒经常不够
+PROBE_CT=6          # 探针 TCP 连接超时
+CONN_CT=5           # 正式连接超时
+
+dbg() { [ -n "${PC_DEBUG:-}" ] && echo "pc[debug]: $*" >&2; return 0; }
+
+env_fp() {
+  { ip -4 addr 2>/dev/null | grep -o "inet [0-9.]*"
+    ip -6 addr 2>/dev/null | grep -o "inet6 [0-9a-f:]*" | grep -v fe80
+  } | sort | cksum | cut -d" " -f1
+}
+
+has_global_v6() {
+  ip -6 addr show scope global 2>/dev/null | grep -q "inet6 ${PC_V6_PREFIX}"
+}
+
+detect_routes() {
+  local out=""
+  if [ -n "$PC_TS_IP" ] && ip -4 addr show 2>/dev/null | grep -q "inet 100\."; then
+    out="app"
+  fi
+  if [ -n "$PC_V6_HOST" ] && has_global_v6; then
+    if [ -z "$out" ]; then out="v6"; else out="$out v6"; fi
+  fi
+  # tsnc 依赖 tailscaled 的 unix socket；socket 不在就别试这条路，免得白等
+  if [ -S "$TS_SOCK" ] && command -v tsnc >/dev/null 2>&1; then
+    if [ -z "$out" ]; then out="proot"; else out="$out proot"; fi
+  fi
+  # socks 走 daemon 的 SOCKS 出口，不依赖 unix socket 文件
+  if command -v ts-socks >/dev/null 2>&1; then
+    out="$out socks"
+  fi
+  echo "$out"
+}
+
+# ---------- tailscale 自愈（不依赖单独的守护脚本） ----------
+
+# SOCKS 出口活着 = daemon 真的能用（socket 文件被删也照样能用）
+ts_port_alive() {
+  timeout 2 bash -c "echo > /dev/tcp/$PC_TS_SOCKS_HOST/$PC_TS_SOCKS_PORT" 2>/dev/null
+}
+
+ts_state() {
+  "$PC_TS_BASE/tailscale" --socket="$TS_SOCK" status --json 2>/dev/null \
+    | grep -m1 '"BackendState"' \
+    | sed -E 's/.*"BackendState"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+}
+
+ts_start() {
+  mkdir -p "$PC_TS_BASE/run" "$PC_TS_BASE/state"
+  [ -S "$TS_SOCK" ] && return 0
+  dbg "启动 tailscaled"
+  # 9>&- 必须加：否则 daemon 继承锁句柄，锁永远不释放
+  nohup "$PC_TS_BASE/tailscaled" --tun=userspace-networking \
+    --socks5-server="$PC_TS_SOCKS_HOST:$PC_TS_SOCKS_PORT" \
+    --outbound-http-proxy-listen="$PC_TS_SOCKS_HOST:$PC_TS_SOCKS_PORT" \
+    --socket="$TS_SOCK" \
+    --state="$PC_TS_BASE/state/tailscaled.state" \
+    --port=41641 >> "$PC_TS_BASE/run/daemon.log" 2>&1 < /dev/null 9>&- &
+  echo $! > "$PC_TS_BASE/run/tsd.pid"
+  local i
+  for i in $(seq 1 60); do [ -S "$TS_SOCK" ] && return 0; sleep 0.1; done
+  return 1
+}
+
+# 取节点名，up 必须显式带上，否则 tailscale 会拒绝执行
+# 固定值：从 status/prefs 读会在 daemon 重启后读到容器主机名，把节点改名
+ts_hostname() {
+  echo "$PC_TS_HOSTNAME"
+}
+
+# 0=可用 1=拉不起来
+ensure_ts() {
+  # SOCKS 出口在 = daemon 真能用，哪怕 socket 文件被删了也不用动它
+  ts_port_alive && return 0
+
+  exec 9>"$PC_TS_BASE/run/pc-ts.lock"
+  flock -w 40 9 || { exec 9>&-; return 1; }
+  ts_port_alive && { exec 9>&-; return 0; }
+
+  # 进程在但两个监听都没有 = 僵尸；只有确认没有活跃 tsnc 会话才重启
+  if pgrep -x tailscaled >/dev/null 2>&1; then
+    local i
+    for i in $(seq 1 15); do ts_port_alive && { exec 9>&-; return 0; }; sleep 0.2; done
+    if pgrep -f "tailscale.* nc " >/dev/null 2>&1; then
+      dbg "有活跃的 tsnc 会话在用 tailscaled，不重启"
+      exec 9>&-
+      return 1
+    fi
+    dbg "重启僵尸 tailscaled"
+    pkill -x tailscaled 2>/dev/null
+    for i in $(seq 1 25); do pgrep -x tailscaled >/dev/null 2>&1 || break; sleep 0.2; done
+    pkill -9 -x tailscaled 2>/dev/null
+    rm -f "$TS_SOCK"
+  fi
+
+  ts_start || { exec 9>&-; return 1; }
+
+  # 有 socket 且状态不是 Running 才需要 up
+  if [ -S "$TS_SOCK" ] && [ "$(ts_state)" != "Running" ]; then
+    local host
+    host=$(ts_hostname)
+    dbg "tailscale up --accept-dns=false --hostname=$host"
+    # up 会一直等到 Running，DERP 不稳时会挂很久；放后台，自己轮询
+    "$PC_TS_BASE/tailscale" --socket="$TS_SOCK" up --accept-dns=false --hostname="$host" \
+      >/tmp/.pc-ts-up.log 2>&1 9>&- &
+    local upid=$! i
+    for i in $(seq 1 160); do
+      if ts_port_alive || [ "$(ts_state)" = "Running" ]; then
+        kill "$upid" 2>/dev/null
+        dbg "tailscale 已就绪"
+        exec 9>&-
+        return 0
+      fi
+      kill -0 "$upid" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill "$upid" 2>/dev/null
+  fi
+
+  local i
+  for i in $(seq 1 60); do ts_port_alive && { exec 9>&-; return 0; }; sleep 0.25; done
+  exec 9>&-
+  dbg "tailscale 仍未就绪，up 输出：$(head -3 /tmp/.pc-ts-up.log 2>/dev/null | tr '\n' ' ')"
+  return 1
+}
+
+# ---------- 路由 ----------
+
+# 设置全局 ROUTE_TARGET / ROUTE_SCP_TARGET / ROUTE_OPTS
+build_route() {
+  local r=$1 ct=$2
+  ROUTE_OPTS=(-o "ConnectTimeout=$ct")
+  case "$r" in
+    app)   ROUTE_TARGET="$PC_USER@$PC_TS_IP"
+           ROUTE_SCP_TARGET="$ROUTE_TARGET" ;;
+    v6)    ROUTE_TARGET="$PC_USER@$PC_V6_HOST"
+           ROUTE_SCP_TARGET="$PC_USER@[$PC_V6_HOST]" ;;
+    proot) ROUTE_TARGET="$PC_USER@$PC_TS_IP"
+           ROUTE_SCP_TARGET="$ROUTE_TARGET"
+           ROUTE_OPTS+=(-o "ProxyCommand=tsnc %h %p") ;;
+    socks) ROUTE_TARGET="$PC_USER@$PC_TS_IP"
+           ROUTE_SCP_TARGET="$ROUTE_TARGET"
+           ROUTE_OPTS+=(-o "ProxyCommand=ts-socks %h %p") ;;
+    *)     return 1 ;;
+  esac
+  return 0
+}
+
+probe_one() {
+  local r=$1
+  # 只有 socks 那条负责拉起 tailscale，避免多条路同时抢着 up
+  if [ "$r" = "socks" ]; then
+    ensure_ts || return 1
+  fi
+  build_route "$r" "$PROBE_CT" || return 1
+  timeout "$PROBE_TIMEOUT" ssh "${SSHOPTS[@]}" -p "$PC_PORT" -o BatchMode=yes \
+    "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "exit 0" >/dev/null 2>&1
+}
+
+# 并行探测，结果按 $ORDER 的优先级写入 WINNERS
+probe_all() {
+  local r pid i
+  local -a pids=()
+  local PDIR
+  PDIR=$(mktemp -d /tmp/.pcprobe.XXXXXX) || return 1
+
+  for r in $ROUTES; do
+    ( probe_one "$r" && : > "$PDIR/$r" ) &
+    pids+=($!)
+  done
+
+  local remaining=${#pids[@]} hit=0
+  while [ "$remaining" -gt 0 ]; do
+    wait -n 2>/dev/null || true
+    remaining=$((remaining - 1))
+    for r in $ROUTES; do
+      [ -f "$PDIR/$r" ] && hit=1
+    done
+    [ "$hit" -eq 1 ] && break
+  done
+
+  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
+  wait 2>/dev/null || true
+
+  WINNERS=""
+  for r in $ORDER; do
+    if [ -f "$PDIR/$r" ]; then
+      WINNERS="$WINNERS $r"
+      dbg "探测通过: $r"
+    else
+      dbg "探测失败: $r"
+    fi
+  done
+  rm -rf "$PDIR"
+  [ -n "$WINNERS" ]
+}
+
+# ---------- 主流程 ----------
+
+MODE=run
+if [ "${1:-}" = "--scp" ]; then
+  MODE=scp
+  shift
+fi
+
+FP=$(env_fp)
+ROUTES=$(detect_routes)
+ORDER="$ROUTES"
+
+if [ -s "$PC_CACHE" ]; then
+  CFP=""; CROUTE=""
+  read -r CFP CROUTE < "$PC_CACHE" 2>/dev/null || true
+  if [ -n "$CFP" ] && [ "$CFP" = "$FP" ] && [ -n "$CROUTE" ] \
+     && echo " $ROUTES " | grep -q " $CROUTE "; then
+    ORDER="$CROUTE $(echo "$ROUTES" | tr ' ' '\n' | grep -v "^$CROUTE$" | tr '\n' ' ')"
+  fi
+fi
+dbg "routes=[$ROUTES] order=[$ORDER]"
+
+if [ -z "$ROUTES" ]; then
+  echo "pc: 当前没有可用路由（检查 Tailscale 是否在线、是否有公网 IPv6）" >&2
+  exit 255
+fi
+
+WINNERS=""
+if ! probe_all; then
+  echo "pc: 所有路由都不通（试过: $(echo "$ROUTES" | xargs)）" >&2
+  exit 255
+fi
+
+# pc --scp "F:\路径\文件" [本地路径]：走赢家那条路把文件拉下来，成功后打印本地路径
+if [ "$MODE" = "scp" ]; then
+  [ $# -ge 1 ] || { echo '用法: pc --scp "F:\路径\文件" [本地路径]' >&2; exit 64; }
+  RP=$(printf '%s' "$1" | sed -E 's#\\#/#g; s#^([A-Za-z]):#/\1:#')
+  case "$RP" in /*) ;; *) RP="/$RP" ;; esac
+  LP=${2:-${PC_INBOX:-$HOME/inbox}/$(basename "$RP")}
+  mkdir -p "$(dirname "$LP")" || exit 1
+  for R in $WINNERS; do
+    build_route "$R" "$CONN_CT" || continue
+    scp -q -P "$PC_PORT" -o StrictHostKeyChecking=accept-new "${ROUTE_OPTS[@]}" \
+      "$ROUTE_SCP_TARGET:$RP" "$LP"
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+      echo "$FP $R" > "$PC_CACHE"
+      echo "$LP"
+      exit 0
+    fi
+    echo "pc: 走 $R 拉文件失败，换下一条" >&2
+  done
+  echo "pc: 拉取失败（试过: $(echo "$WINNERS" | xargs)）" >&2
+  exit 255
+fi
+
+for R in $WINNERS; do
+  build_route "$R" "$CONN_CT" || continue
+  if [ $# -gt 0 ]; then
+    ssh "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "$@"
+  else
+    ssh -t "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET"
+  fi
+  RC=$?
+  if [ "$RC" -ne 255 ]; then
+    echo "$FP $R" > "$PC_CACHE"
+    exit "$RC"
+  fi
+  echo "pc: 走 $R 断了，换下一条" >&2
+done
+
+echo "pc: 所有可用路径都失败了" >&2
+exit 255

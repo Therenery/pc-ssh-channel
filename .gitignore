@@ -1,0 +1,7 @@
+*.conf
+!config/pc.conf.example
+id_*
+*.pem
+*.key
+known_hosts
+.DS_Store

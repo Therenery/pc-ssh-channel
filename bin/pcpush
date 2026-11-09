@@ -1,0 +1,27 @@
+#!/bin/sh
+# pcpush —— 把本地文件推到电脑上的指定路径
+#
+# 用法：pcpush <本地文件> <Windows 路径>
+#
+# Windows 的 OpenSSH 命令行有 8191 字符上限，直接传大段 base64 会被截断。
+# 这里按 4000 字节切片，分多次走 ssh stdin 追加写，最后在电脑上解码。
+set -e
+src="$1"; dst="$2"
+[ -n "$src" ] && [ -n "$dst" ] || { echo "用法: pcpush <本地文件> <Windows 路径>" >&2; exit 64; }
+
+rm -rf /tmp/_push; mkdir -p /tmp/_push
+base64 -w0 "$src" > /tmp/_push/all.b64
+split -b 4000 -a 3 /tmp/_push/all.b64 /tmp/_push/part.
+first=1
+for f in /tmp/_push/part.*; do
+  if [ "$first" -eq 1 ]; then
+    cmd="[IO.File]::WriteAllText('$dst.b64', [Console]::In.ReadToEnd())"
+    first=0
+  else
+    cmd="[IO.File]::AppendAllText('$dst.b64', [Console]::In.ReadToEnd())"
+  fi
+  cat "$f" | pc "powershell -NoProfile -Command \"$cmd\"" 2>/dev/null
+done
+pc "powershell -NoProfile -Command \"[IO.File]::WriteAllBytes('$dst', [Convert]::FromBase64String([IO.File]::ReadAllText('$dst.b64'))); Remove-Item '$dst.b64'\"" 2>/dev/null
+rm -rf /tmp/_push
+echo "pushed $src -> $dst"

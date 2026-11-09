@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# pces —— 用电脑(Windows)上 Everything 的 HTTP 接口做全盘搜索
+#
+# 前置：电脑端 Everything 已开启 HTTP Server（工具 → 选项 → HTTP）
+# 用法：pces "关键词" [数量]
+# 例：  pces "机器工具清单"      pces "ext:py" 30
+q="${1:?用法: pces \"关键词\" [数量]}"
+n="${2:-20}"
+CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
+[ -r "$CONF" ] && . "$CONF"
+port="${PC_EVERYTHING_PORT:-18080}"
+enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$q")
+out=$(pc "curl.exe -s \"http://127.0.0.1:$port/?json=1&count=$n&path_column=1&search=$enc\"" 2>/dev/null)
+printf '%s' "$out" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print("解析失败:", e); sys.exit(1)
+rs = d.get("results", [])
+print("命中 %d 条，显示 %d 条：" % (d.get("totalResults", 0), len(rs)))
+for r in rs:
+    print("  " + (r.get("path", "") or "") + "\\" + (r.get("name", "") or ""))
+'

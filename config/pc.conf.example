@@ -1,0 +1,40 @@
+# pc 配置文件
+# 复制到 ~/.config/pc/pc.conf 后按实际情况修改。
+
+# 电脑上的登录用户名（Windows 用户名）
+PC_USER="me"
+
+# 路由 1：Tailscale 地址，填 100.x.y.z 或 MagicDNS 名
+PC_TS_IP="100.64.0.10"
+
+# 路由 2：公网 / 校园网 IPv6 地址，没有就留空
+PC_V6_HOST=""
+
+# 只有本机地址以这个前缀开头时才尝试 v6 路由（留空 = 任意公网 v6）
+# 例：PC_V6_PREFIX="2001:db8"
+PC_V6_PREFIX=""
+
+# SSH 端口
+PC_PORT=22
+
+# 手机在 tailnet 里的节点名
+PC_TS_HOSTNAME="android-proot"
+
+# tailscale 静态二进制目录（含 tailscaled 与 tailscale 两个文件）
+PC_TS_BASE="$HOME/.local/tailscale"
+
+# tailscaled 的 SOCKS5 监听
+PC_TS_SOCKS_HOST="127.0.0.1"
+PC_TS_SOCKS_PORT=1066
+
+# 路由缓存：记录上次成功的路由
+PC_CACHE="${TMPDIR:-/tmp}/.pc-route"
+
+# 拉回来的文件放这里
+PC_INBOX="$HOME/inbox"
+
+# pcget 用的本地 HTTP 端口
+PC_HTTP_PORT=8099
+
+# 电脑上 Everything HTTP Server 的端口
+PC_EVERYTHING_PORT=18080
