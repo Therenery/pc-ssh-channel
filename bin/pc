@@ -23,6 +23,9 @@ PC_TS_BASE="${PC_TS_BASE:-$HOME/.local/tailscale}"
 PC_TS_HOSTNAME="${PC_TS_HOSTNAME:-android-proot}"
 PC_TS_SOCKS_HOST="${PC_TS_SOCKS_HOST:-127.0.0.1}"
 PC_TS_SOCKS_PORT="${PC_TS_SOCKS_PORT:-1066}"
+PC_LAN_HOST="${PC_LAN_HOST:-}"
+PC_STATE_DIR="${PC_STATE_DIR:-$HOME/.local/state/pc}"
+PC_LAN_STATE="$PC_STATE_DIR/lan-host"
 PC_CACHE="${PC_CACHE:-${TMPDIR:-/tmp}/.pc-route}"
 
 TS_SOCK="$PC_TS_BASE/run/tailscaled.sock"
@@ -58,10 +61,66 @@ has_global_v6() {
   ip -6 addr show scope global 2>/dev/null | grep -q "inet6 ${PC_V6_PREFIX}"
 }
 
+# ---------- 局域网路由 ----------
+# 只有手机和电脑在同一网段时才有意义：同网段直连不过路由器，延迟从 10ms 降到 1ms 量级。
+# 跨网段时校园网会把 22 端口拦掉（实测），所以必须先做子网判断，不能盲探。
+
+ip2int() {
+  local IFS=.
+  set -- $1
+  echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+}
+
+# $1=本机地址 $2=前缀长度 $3=对端地址
+same_subnet() {
+  local a b mask
+  a=$(ip2int "$1") || return 1
+  b=$(ip2int "$3") || return 1
+  mask=$(( (0xFFFFFFFF << (32 - $2)) & 0xFFFFFFFF ))
+  [ $(( a & mask )) -eq $(( b & mask )) ]
+}
+
+# 本机真实网卡的 IPv4/前缀（排除回环、链路本地、tailscale、clash 的 tun）
+local_nets() {
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$2 !~ /^(lo|tun|tailscale|utun)/ {print $4}' \
+    | grep -E '^[0-9]+\.' \
+    | grep -v -E '^(127\.|169\.254\.|100\.)'
+}
+
+# 给定的 IPv4 是否落在本机某个网段里；命中则输出该网段，返回 0
+lan_in_subnet() {
+  local target=$1 cidr ip pref
+  while read -r cidr; do
+    ip=${cidr%/*}; pref=${cidr#*/}
+    if same_subnet "$ip" "$pref" "$target"; then
+      echo "$cidr"
+      return 0
+    fi
+  done < <(local_nets)
+  return 1
+}
+
+# 选出可用的局域网地址：配置优先，其次用上次学习到的
+lan_candidate() {
+  local h
+  for h in "$PC_LAN_HOST" "$(awk '{print $2}' "$PC_LAN_STATE" 2>/dev/null | tr -d ' \r\n')"; do
+    [ -n "$h" ] || continue
+    lan_in_subnet "$h" >/dev/null && { echo "$h"; return 0; }
+  done
+  return 1
+}
+
 detect_routes() {
   local out=""
+  # 局域网优先级最高：同网段时直连，不经过任何隧道和路由器
+  if LAN_HOST=$(lan_candidate); then
+    out="lan"
+  else
+    LAN_HOST=""
+  fi
   if [ -n "$PC_TS_IP" ] && ip -4 addr show 2>/dev/null | grep -q "inet 100\."; then
-    out="app"
+    if [ -z "$out" ]; then out="app"; else out="$out app"; fi
   fi
   if [ -n "$PC_V6_HOST" ] && has_global_v6; then
     if [ -z "$out" ]; then out="v6"; else out="$out v6"; fi
@@ -139,6 +198,7 @@ ensure_ts() {
   fi
 
   ts_start || { exec 9>&-; return 1; }
+  local fresh=1
 
   # 有 socket 且状态不是 Running 才需要 up
   if [ -S "$TS_SOCK" ] && [ "$(ts_state)" != "Running" ]; then
@@ -150,9 +210,10 @@ ensure_ts() {
       >/tmp/.pc-ts-up.log 2>&1 9>&- &
     local upid=$! i
     for i in $(seq 1 160); do
-      if ts_port_alive || [ "$(ts_state)" = "Running" ]; then
+      if [ "$(ts_state)" = "Running" ]; then
         kill "$upid" 2>/dev/null
         dbg "tailscale 已就绪"
+        [ "${fresh:-0}" = 1 ] && sleep 3
         exec 9>&-
         return 0
       fi
@@ -163,7 +224,14 @@ ensure_ts() {
   fi
 
   local i
-  for i in $(seq 1 60); do ts_port_alive && { exec 9>&-; return 0; }; sleep 0.25; done
+  for i in $(seq 1 60); do ts_port_alive && break; sleep 0.25; done
+  # 端口在监听 ≠ 节点已连上对端：刚拉起的 daemon 还要几秒做 DERP 握手，
+  # 这期间发探针必然超时，会误判成"所有路由都不通"
+  if [ "${fresh:-0}" = 1 ] && ts_port_alive; then
+    dbg "新 daemon，等 peer 握手"
+    sleep 3
+  fi
+  if ts_port_alive; then exec 9>&-; return 0; fi
   exec 9>&-
   dbg "tailscale 仍未就绪，up 输出：$(head -3 /tmp/.pc-ts-up.log 2>/dev/null | tr '\n' ' ')"
   return 1
@@ -176,6 +244,8 @@ build_route() {
   local r=$1 ct=$2
   ROUTE_OPTS=(-o "ConnectTimeout=$ct")
   case "$r" in
+    lan)   ROUTE_TARGET="$PC_USER@$LAN_HOST"
+           ROUTE_SCP_TARGET="$ROUTE_TARGET" ;;
     app)   ROUTE_TARGET="$PC_USER@$PC_TS_IP"
            ROUTE_SCP_TARGET="$ROUTE_TARGET" ;;
     v6)    ROUTE_TARGET="$PC_USER@$PC_V6_HOST"
@@ -192,12 +262,16 @@ build_route() {
 }
 
 probe_one() {
-  local r=$1
+  local r=$1 ct=$PROBE_CT
   # 只有 socks 那条负责拉起 tailscale，避免多条路同时抢着 up
   if [ "$r" = "socks" ]; then
+    # 局域网可用时先让它试一下：同网段 20ms 就通，没必要为它去拉起 tailscaled
+    case " $ROUTES " in *" lan "*) sleep 1.2 ;; esac
     ensure_ts || return 1
   fi
-  build_route "$r" "$PROBE_CT" || return 1
+  # 局域网要么秒通要么就是不在同一个网，等久了没意义
+  [ "$r" = "lan" ] && ct=3
+  build_route "$r" "$ct" || return 1
   timeout "$PROBE_TIMEOUT" ssh "${SSHOPTS[@]}" -p "$PC_PORT" -o BatchMode=yes \
     "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "exit 0" >/dev/null 2>&1
 }
@@ -248,7 +322,35 @@ if [ "${1:-}" = "--scp" ]; then
   shift
 fi
 
+# --learn-lan <route>：内部用。借已连通的路问电脑的局域网 IPv4，存下来供下次判断。
+# 只在手机网络指纹变化后触发一次，不会每次都多开一条连接。
+if [ "${1:-}" = "--learn-lan" ]; then
+  LR=${2:-}
+  [ -n "$LR" ] || exit 64
+  [ "$LR" = "lan" ] && exit 0
+  build_route "$LR" "$CONN_CT" || exit 1
+  PS_CMD="\$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1; if (\$r) { (Get-NetIPAddress -InterfaceIndex \$r.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }"
+  B64=$(printf '%s' "$PS_CMD" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
+  V4=$(ssh "${SSHOPTS[@]}" -p "$PC_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+        "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "powershell -NoProfile -EncodedCommand $B64" 2>/dev/null \
+        | tr -d ' \r\n')
+  case "$V4" in
+    *[0-9].[0-9]*.[0-9]*.[0-9]*)
+      mkdir -p "$PC_STATE_DIR" && printf '%s %s\n' "$(env_fp)" "$V4" > "$PC_LAN_STATE" ;;
+  esac
+  exit 0
+fi
+
 FP=$(env_fp)
+
+# 局域网地址只在网络指纹变化后重新学习一次
+need_learn() {
+  local sfp
+  [ -r "$PC_LAN_STATE" ] || return 0
+  sfp=$(awk 'NR==1{print $1}' "$PC_LAN_STATE" 2>/dev/null)
+  [ "$sfp" = "$FP" ] && return 1
+  return 0
+}
 ROUTES=$(detect_routes)
 ORDER="$ROUTES"
 
@@ -260,6 +362,12 @@ if [ -s "$PC_CACHE" ]; then
     ORDER="$CROUTE $(echo "$ROUTES" | tr ' ' '\n' | grep -v "^$CROUTE$" | tr '\n' ' ')"
   fi
 fi
+
+# 局域网只要可用就排第一：同网段直连一定比任何隧道都快，不必参考缓存
+case " $ORDER " in
+  *" lan "*)
+    ORDER="lan $(echo "$ORDER" | tr ' ' '\n' | grep -v '^lan$' | tr '\n' ' ')" ;;
+esac
 dbg "routes=[$ROUTES] order=[$ORDER]"
 
 if [ -z "$ROUTES" ]; then
@@ -287,6 +395,9 @@ if [ "$MODE" = "scp" ]; then
     RC=$?
     if [ "$RC" -eq 0 ]; then
       echo "$FP $R" > "$PC_CACHE"
+      if [ "$R" != "lan" ] && need_learn; then
+        nohup "$0" --learn-lan "$R" >/dev/null 2>&1 &
+      fi
       echo "$LP"
       exit 0
     fi
@@ -306,6 +417,9 @@ for R in $WINNERS; do
   RC=$?
   if [ "$RC" -ne 255 ]; then
     echo "$FP $R" > "$PC_CACHE"
+    if [ "$R" != "lan" ] && need_learn; then
+      nohup "$0" --learn-lan "$R" >/dev/null 2>&1 &
+    fi
     exit "$RC"
   fi
   echo "pc: 走 $R 断了，换下一条" >&2

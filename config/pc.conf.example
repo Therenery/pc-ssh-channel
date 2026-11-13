@@ -17,6 +17,11 @@ PC_V6_PREFIX=""
 # SSH 端口
 PC_PORT=22
 
+# 局域网路由：电脑的局域网 IPv4（可选）
+# 只有本机和电脑在同一网段时才会启用，跨网段自动忽略。
+# 留空 = 自动学习（连上后问一次，存在 ~/.local/state/pc/lan-host）。
+PC_LAN_HOST=""
+
 # 手机在 tailnet 里的节点名
 PC_TS_HOSTNAME="android-proot"
 

@@ -51,10 +51,16 @@
 
 | 路由 | 条件 | 说明 |
 | --- | --- | --- |
+| `lan` | 电脑的局域网 IPv4 与本机在同一个网段 | 局域网直连，延迟最低；地址可自动学习 |
 | `app` | 本机有 `100.x` 地址 | 走 Android 上的 Tailscale App |
 | `v6` | 本机有公网 IPv6，且配置了 `PC_V6_HOST` | 直连，不需要 VPN |
 | `proot` | tailscaled 的 unix socket 存在 | 用户态 Tailscale，经 `tailscale nc` |
 | `socks` | 有 `ts-socks` | 用户态 Tailscale，经 SOCKS5 出口 |
+
+`lan` 只在同网段时出现：先按真实掩码判断子网，命中才探测，跨网段直接跳过。
+电脑的局域网地址不需要手填——每次连上后会后台问一次并缓存到
+`~/.local/state/pc/lan-host`，只在手机网络指纹变化后重新学习。
+想固定的话在配置里写 `PC_LAN_HOST`，配置优先于自动学习。
 
 ## 快速开始
 
