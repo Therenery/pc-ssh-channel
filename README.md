@@ -51,13 +51,15 @@
 
 | 路由 | 条件 | 说明 |
 | --- | --- | --- |
-| `lan` | 电脑的局域网 IPv4 与本机在同一个网段 | 局域网直连，延迟最低；地址可自动学习 |
+| `lan` | 电脑的局域网 IPv4 与本机同网段，或同属一个私有网段大类 | 局域网直连，延迟最低；地址可自动学习 |
 | `app` | 本机有 `100.x` 地址 | 走 Android 上的 Tailscale App |
 | `v6` | 本机有公网 IPv6，且配置了 `PC_V6_HOST` | 直连，不需要 VPN |
 | `proot` | tailscaled 的 unix socket 存在 | 用户态 Tailscale，经 `tailscale nc` |
 | `socks` | 有 `ts-socks` | 用户态 Tailscale，经 SOCKS5 出口 |
 
-`lan` 只在同网段时出现：先按真实掩码判断子网，命中才探测，跨网段直接跳过。
+`lan` 按两级判断：同网段（真实掩码）无条件启用；跨子网但同属一个私有地址大类（`10/8`、`172.16/12`、`192.168/16`）时也试一次，适配校园网这类三层可达的场景。探测结果按网络指纹缓存到 `~/.local/state/pc/lan-try`，失败过的网络下次直接跳过，不会反复等 3 秒。
+
+`lan` 会先单独探测，通了就不再拉起 tailscaled，也不会被并行探测的提前退出误杀。
 电脑的局域网地址不需要手填——每次连上后会后台问一次并缓存到
 `~/.local/state/pc/lan-host`，只在手机网络指纹变化后重新学习。
 想固定的话在配置里写 `PC_LAN_HOST`，配置优先于自动学习。
@@ -191,6 +193,14 @@ ssh -v -o ConnectTimeout=25 用户名@地址 "exit 0"
 ```
 
 移动网络 RTT 常到 300~600ms，5 秒超时可能误判。`pc` 的探针上限是 15 秒；临时排查时把 `CONN_CT` 调大。
+
+**局域网地址能 ping 通，但 `pc` 不走 lan**
+
+按顺序查三处：
+
+1. Windows 防火墙。sshd 自带规则通常只覆盖 Private profile。若电脑所在网络被识别为 Public，22 端口会被默认策略丢掉，需要单独加一条 Public 规则放行来源网段。
+2. 客户端的 `IdentityFile`。`ssh_config` 里若按 `Host` 指定密钥，局域网地址必须命中同一个 Host 模式，否则 ssh 不会提供任何密钥，表现为 `Permission denied (publickey)`。
+3. 学习到的地址过期。删掉 `~/.local/state/pc/lan-host` 和 `lan-try`，下次连接会重新学习。
 
 **IPv6 路由不通，但 ping 能通**
 

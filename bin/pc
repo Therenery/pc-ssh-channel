@@ -12,7 +12,9 @@
 set -u
 
 CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
+[ -r /usr/local/bin/_pc_env.sh ] && . /usr/local/bin/_pc_env.sh
 [ -r "$CONF" ] && . "$CONF"
+[ -r /usr/local/bin/_pc_conf_default.sh ] && . /usr/local/bin/_pc_conf_default.sh
 
 PC_USER="${PC_USER:-}"
 PC_TS_IP="${PC_TS_IP:-}"
@@ -26,6 +28,7 @@ PC_TS_SOCKS_PORT="${PC_TS_SOCKS_PORT:-1066}"
 PC_LAN_HOST="${PC_LAN_HOST:-}"
 PC_STATE_DIR="${PC_STATE_DIR:-$HOME/.local/state/pc}"
 PC_LAN_STATE="$PC_STATE_DIR/lan-host"
+PC_LAN_TRY="$PC_STATE_DIR/lan-try"
 PC_CACHE="${PC_CACHE:-${TMPDIR:-/tmp}/.pc-route}"
 
 TS_SOCK="$PC_TS_BASE/run/tailscaled.sock"
@@ -80,6 +83,26 @@ same_subnet() {
   [ $(( a & mask )) -eq $(( b & mask )) ]
 }
 
+# 归类私有地址：10/8、172.16/12、192.168/16；非私有返回 1
+private_block() {
+  local n b1 b2
+  n=$(ip2int "$1") || return 1
+  b1=$(( n >> 24 ))
+  b2=$(( (n >> 16) & 0xFF ))
+  if [ "$b1" -eq 10 ]; then echo "10/8"; return 0; fi
+  if [ "$b1" -eq 172 ] && [ "$b2" -ge 16 ] && [ "$b2" -le 31 ]; then echo "172.16/12"; return 0; fi
+  if [ "$b1" -eq 192 ] && [ "$b2" -eq 168 ]; then echo "192.168/16"; return 0; fi
+  return 1
+}
+
+# 两个地址是否同属一个私有网段大类（校园网里常见跨子网但三层可达）
+same_block() {
+  local x y
+  x=$(private_block "$1") || return 1
+  y=$(private_block "$2") || return 1
+  [ "$x" = "$y" ]
+}
+
 # 本机真实网卡的 IPv4/前缀（排除回环、链路本地、tailscale、clash 的 tun）
 local_nets() {
   ip -4 -o addr show scope global 2>/dev/null \
@@ -101,12 +124,26 @@ lan_in_subnet() {
   return 1
 }
 
+# 当前网络下局域网是否刚探测失败过，避免每个网络反复等 3 秒
+lan_recently_failed() {
+  local tfp tres
+  [ -r "$PC_LAN_TRY" ] || return 1
+  read -r tfp tres < "$PC_LAN_TRY" 2>/dev/null || return 1
+  [ "$tfp" = "$FP" ] && [ "$tres" = "fail" ]
+}
+
 # 选出可用的局域网地址：配置优先，其次用上次学习到的
+# 同网段无条件启用；跨子网但同属一个私有网段大类时，也试一次（校园网三层可达）
 lan_candidate() {
-  local h
+  local h cidr self
   for h in "$PC_LAN_HOST" "$(awk '{print $2}' "$PC_LAN_STATE" 2>/dev/null | tr -d ' \r\n')"; do
     [ -n "$h" ] || continue
     lan_in_subnet "$h" >/dev/null && { echo "$h"; return 0; }
+    while read -r cidr; do
+      self=${cidr%/*}
+      same_block "$self" "$h" || continue
+      lan_recently_failed || { echo "$h"; return 0; }
+    done < <(local_nets)
   done
   return 1
 }
@@ -114,10 +151,8 @@ lan_candidate() {
 detect_routes() {
   local out=""
   # 局域网优先级最高：同网段时直连，不经过任何隧道和路由器
-  if LAN_HOST=$(lan_candidate); then
+  if [ -n "$LAN_HOST" ]; then
     out="lan"
-  else
-    LAN_HOST=""
   fi
   if [ -n "$PC_TS_IP" ] && ip -4 addr show 2>/dev/null | grep -q "inet 100\."; then
     if [ -z "$out" ]; then out="app"; else out="$out app"; fi
@@ -274,6 +309,17 @@ probe_one() {
   build_route "$r" "$ct" || return 1
   timeout "$PROBE_TIMEOUT" ssh "${SSHOPTS[@]}" -p "$PC_PORT" -o BatchMode=yes \
     "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "exit 0" >/dev/null 2>&1
+  local rc=$?
+  # 记下本次网络下局域网探测的结果，失败的网络下次直接跳过，不再白等 3 秒
+  if [ "$r" = "lan" ]; then
+    mkdir -p "$PC_STATE_DIR" 2>/dev/null
+    if [ "$rc" -eq 0 ]; then
+      printf '%s ok\n' "$FP" > "$PC_LAN_TRY" 2>/dev/null
+    else
+      printf '%s fail\n' "$FP" > "$PC_LAN_TRY" 2>/dev/null
+    fi
+  fi
+  return "$rc"
 }
 
 # 并行探测，结果按 $ORDER 的优先级写入 WINNERS
@@ -283,7 +329,23 @@ probe_all() {
   local PDIR
   PDIR=$(mktemp -d /tmp/.pcprobe.XXXXXX) || return 1
 
-  for r in $ROUTES; do
+  # 局域网单独先试：通了就不必再拉起 tailscaled，也不会被并行探测的提前退出误杀
+  local todo="$ROUTES"
+  case " $ROUTES " in
+    *" lan "*)
+      if probe_one lan; then
+        dbg "探测通过: lan"
+        WINNERS="lan"
+        rm -rf "$PDIR"
+        return 0
+      fi
+      dbg "探测失败: lan"
+      todo=$(echo "$ROUTES" | tr ' ' '\n' | grep -v '^lan$' | tr '\n' ' ')
+      ;;
+  esac
+  [ -n "${todo// /}" ] || { rm -rf "$PDIR"; WINNERS=""; return 1; }
+
+  for r in $todo; do
     ( probe_one "$r" && : > "$PDIR/$r" ) &
     pids+=($!)
   done
@@ -303,6 +365,7 @@ probe_all() {
 
   WINNERS=""
   for r in $ORDER; do
+    [ "$r" = "lan" ] && continue
     if [ -f "$PDIR/$r" ]; then
       WINNERS="$WINNERS $r"
       dbg "探测通过: $r"
@@ -351,6 +414,8 @@ need_learn() {
   [ "$sfp" = "$FP" ] && return 1
   return 0
 }
+# detect_routes 在命令替换里跑，LAN_HOST 必须在主 shell 先算好再传进去
+LAN_HOST=$(lan_candidate) || LAN_HOST=""
 ROUTES=$(detect_routes)
 ORDER="$ROUTES"
 
