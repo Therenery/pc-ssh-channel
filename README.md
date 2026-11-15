@@ -54,6 +54,7 @@
 | `lan` | 电脑的局域网 IPv4 与本机同网段，或同属一个私有网段大类 | 局域网直连，延迟最低；地址可自动学习 |
 | `app` | 本机有 `100.x` 地址 | 走 Android 上的 Tailscale App |
 | `v6` | 本机有公网 IPv6，且配置了 `PC_V6_HOST` | 直连，不需要 VPN |
+| `srv` | 配置了 `PC_SRV_HOST`（或 `SRV_HOST`）且有 `PC_TS_IP` | 经云服务器跳板连电脑 Tailscale IP，不依赖手机端 `tailscaled`，移动网络下可绕开海外 DERP |
 | `proot` | tailscaled 的 unix socket 存在 | 用户态 Tailscale，经 `tailscale nc` |
 | `socks` | 有 `ts-socks` | 用户态 Tailscale，经 SOCKS5 出口 |
 

@@ -16,11 +16,19 @@ CONF="${PC_CONF:-$HOME/.config/pc/pc.conf}"
 [ -r "$CONF" ] && . "$CONF"
 [ -r /usr/local/bin/_pc_conf_default.sh ] && . /usr/local/bin/_pc_conf_default.sh
 
+SRV_CONF="${SRV_CONF:-$HOME/.config/srv/srv.conf}"
+[ -r /usr/local/bin/_srv_conf.sh ] && . /usr/local/bin/_srv_conf.sh
+[ -r "$SRV_CONF" ] && . "$SRV_CONF"
+
 PC_USER="${PC_USER:-}"
 PC_TS_IP="${PC_TS_IP:-}"
 PC_V6_HOST="${PC_V6_HOST:-}"
 PC_V6_PREFIX="${PC_V6_PREFIX:-}"
 PC_PORT="${PC_PORT:-22}"
+PC_SRV_HOST="${PC_SRV_HOST:-${SRV_HOST:-}}"
+PC_SRV_PORT="${PC_SRV_PORT:-${SRV_PORT:-22}}"
+PC_SRV_USER="${PC_SRV_USER:-${SRV_USER:-root}}"
+PC_SRV_ID="${PC_SRV_ID:-${SRV_ID:-$HOME/.ssh/id_ed25519}}"
 PC_TS_BASE="${PC_TS_BASE:-$HOME/.local/tailscale}"
 PC_TS_HOSTNAME="${PC_TS_HOSTNAME:-android-proot}"
 PC_TS_SOCKS_HOST="${PC_TS_SOCKS_HOST:-127.0.0.1}"
@@ -160,6 +168,10 @@ detect_routes() {
   if [ -n "$PC_V6_HOST" ] && has_global_v6; then
     if [ -z "$out" ]; then out="v6"; else out="$out v6"; fi
   fi
+  # 经云服务器跳板连电脑 Tailscale IP（不依赖手机端 tailscaled，国内直连绕开海外 DERP）
+  if [ -n "$PC_TS_IP" ] && [ -n "$PC_SRV_HOST" ]; then
+    if [ -z "$out" ]; then out="srv"; else out="$out srv"; fi
+  fi
   # tsnc 依赖 tailscaled 的 unix socket；socket 不在就别试这条路，免得白等
   if [ -S "$TS_SOCK" ] && command -v tsnc >/dev/null 2>&1; then
     if [ -z "$out" ]; then out="proot"; else out="$out proot"; fi
@@ -285,6 +297,12 @@ build_route() {
            ROUTE_SCP_TARGET="$ROUTE_TARGET" ;;
     v6)    ROUTE_TARGET="$PC_USER@$PC_V6_HOST"
            ROUTE_SCP_TARGET="$PC_USER@[$PC_V6_HOST]" ;;
+    srv)   ROUTE_TARGET="$PC_USER@$PC_TS_IP"
+           ROUTE_SCP_TARGET="$ROUTE_TARGET"
+           local srv_cmd="ssh -p $PC_SRV_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=$ct"
+           [ -r "$PC_SRV_ID" ] && srv_cmd="$srv_cmd -i $PC_SRV_ID"
+           srv_cmd="$srv_cmd -W %h:%p $PC_SRV_USER@$PC_SRV_HOST"
+           ROUTE_OPTS+=(-o "ProxyCommand=$srv_cmd") ;;
     proot) ROUTE_TARGET="$PC_USER@$PC_TS_IP"
            ROUTE_SCP_TARGET="$ROUTE_TARGET"
            ROUTE_OPTS+=(-o "ProxyCommand=tsnc %h %p") ;;
