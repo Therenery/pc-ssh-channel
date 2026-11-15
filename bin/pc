@@ -37,16 +37,17 @@ PC_LAN_HOST="${PC_LAN_HOST:-}"
 PC_STATE_DIR="${PC_STATE_DIR:-$HOME/.local/state/pc}"
 PC_LAN_STATE="$PC_STATE_DIR/lan-host"
 PC_LAN_TRY="$PC_STATE_DIR/lan-try"
+# 路由缓存已移除：每次均实时多路并发竞速，谁先握手成功用谁，不被历史缓存误导。
 PC_CACHE="${PC_CACHE:-${TMPDIR:-/tmp}/.pc-route}"
 
 TS_SOCK="$PC_TS_BASE/run/tailscaled.sock"
 
 if [ -z "$PC_USER" ]; then
-  echo "pc: 缺少 PC_USER，请在 $CONF 里配置（参考 config/pc.conf.example）" >&2
+  echo "pc: missing PC_USER in $CONF (see config/pc.conf.example)" >&2
   exit 78
 fi
 if [ -z "$PC_TS_IP" ] && [ -z "$PC_V6_HOST" ]; then
-  echo "pc: PC_TS_IP 与 PC_V6_HOST 至少填一个" >&2
+  echo "pc: at least one of PC_TS_IP or PC_V6_HOST is required" >&2
   exit 78
 fi
 
@@ -57,10 +58,51 @@ SSHOPTS=(-o StrictHostKeyChecking=accept-new
          -o ServerAliveInterval=5
          -o ServerAliveCountMax=6)
 PROBE_TIMEOUT=15    # 单条探针总上限（秒）；移动网络下 8 秒经常不够
-PROBE_CT=6          # 探针 TCP 连接超时
-CONN_CT=5           # 正式连接超时
+PROBE_CT=8          # 探针 TCP 连接超时
+CONN_CT=10          # 正式连接超时（覆盖 DERP 冷握手延迟）
 
-dbg() { [ -n "${PC_DEBUG:-}" ] && echo "pc[debug]: $*" >&2; return 0; }
+PC_CONNECTED=0
+PC_START_TS=$(date +%s)
+TICKER_PID=""
+
+stop_ticker() {
+  local p="${TICKER_PID:-}"
+  TICKER_PID=""
+  if [ -n "$p" ]; then
+    kill "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+    [ -t 2 ] && printf '\r\033[K' >&2
+  fi
+}
+trap stop_ticker EXIT INT TERM
+
+start_ticker() {
+  [ -n "${PC_QUIET:-}" ] && return 0
+  [ -n "${TICKER_PID:-}" ] && return 0
+  (
+    local sec=0
+    while true; do
+      sec=$(( $(date +%s) - PC_START_TS ))
+      if [ -t 2 ]; then
+        printf '\r\033[Kpc: connecting [%s]... %ds' "${ROUTES:-...}" "$sec" >&2
+      else
+        printf 'pc: connecting [%s]... %ds\n' "${ROUTES:-...}" "$sec" >&2
+      fi
+      sleep 1
+    done
+  ) &
+  TICKER_PID=$!
+}
+
+# 连接成功前默认打印全部过程 log 到 stderr（不污染 stdout）
+dbg() {
+  [ -n "${PC_QUIET:-}" ] && return 0
+  if [ "$PC_CONNECTED" -eq 0 ] || [ -n "${PC_DEBUG:-}" ]; then
+    [ -t 2 ] && printf '\r\033[K' >&2
+    printf 'pc: %s\n' "$*" >&2
+  fi
+  return 0
+}
 
 env_fp() {
   { ip -4 addr 2>/dev/null | grep -o "inet [0-9.]*"
@@ -172,8 +214,9 @@ detect_routes() {
   if [ -n "$PC_TS_IP" ] && [ -n "$PC_SRV_HOST" ]; then
     if [ -z "$out" ]; then out="srv"; else out="$out srv"; fi
   fi
-  # tsnc 依赖 tailscaled 的 unix socket；socket 不在就别试这条路，免得白等
-  if [ -S "$TS_SOCK" ] && command -v tsnc >/dev/null 2>&1; then
+  # tsnc 依赖 tailscaled 的 unix socket 且 daemon 真正响应；socket 假死时不盲试
+  if [ -S "$TS_SOCK" ] && command -v tsnc >/dev/null 2>&1 \
+     && timeout 1 "$PC_TS_BASE/tailscale" --socket="$TS_SOCK" status --peers=false >/dev/null 2>&1; then
     if [ -z "$out" ]; then out="proot"; else out="$out proot"; fi
   fi
   # socks 走 daemon 的 SOCKS 出口，不依赖 unix socket 文件
@@ -198,8 +241,9 @@ ts_state() {
 
 ts_start() {
   mkdir -p "$PC_TS_BASE/run" "$PC_TS_BASE/state"
-  [ -S "$TS_SOCK" ] && return 0
-  dbg "启动 tailscaled"
+  [ -S "$TS_SOCK" ] && pgrep -x tailscaled >/dev/null 2>&1 && return 0
+  rm -f "$TS_SOCK"
+  dbg "starting tailscaled"
   # 9>&- 必须加：否则 daemon 继承锁句柄，锁永远不释放
   nohup "$PC_TS_BASE/tailscaled" --tun=userspace-networking \
     --socks5-server="$PC_TS_SOCKS_HOST:$PC_TS_SOCKS_PORT" \
@@ -233,11 +277,11 @@ ensure_ts() {
     local i
     for i in $(seq 1 15); do ts_port_alive && { exec 9>&-; return 0; }; sleep 0.2; done
     if pgrep -f "tailscale.* nc " >/dev/null 2>&1; then
-      dbg "有活跃的 tsnc 会话在用 tailscaled，不重启"
+      dbg "active tsnc session found, skipping tailscaled restart"
       exec 9>&-
       return 1
     fi
-    dbg "重启僵尸 tailscaled"
+    dbg "restarting stale tailscaled"
     pkill -x tailscaled 2>/dev/null
     for i in $(seq 1 25); do pgrep -x tailscaled >/dev/null 2>&1 || break; sleep 0.2; done
     pkill -9 -x tailscaled 2>/dev/null
@@ -259,7 +303,7 @@ ensure_ts() {
     for i in $(seq 1 160); do
       if [ "$(ts_state)" = "Running" ]; then
         kill "$upid" 2>/dev/null
-        dbg "tailscale 已就绪"
+        dbg "tailscale ready"
         [ "${fresh:-0}" = 1 ] && sleep 3
         exec 9>&-
         return 0
@@ -275,12 +319,12 @@ ensure_ts() {
   # 端口在监听 ≠ 节点已连上对端：刚拉起的 daemon 还要几秒做 DERP 握手，
   # 这期间发探针必然超时，会误判成"所有路由都不通"
   if [ "${fresh:-0}" = 1 ] && ts_port_alive; then
-    dbg "新 daemon，等 peer 握手"
+    dbg "waiting for peer handshake"
     sleep 3
   fi
   if ts_port_alive; then exec 9>&-; return 0; fi
   exec 9>&-
-  dbg "tailscale 仍未就绪，up 输出：$(head -3 /tmp/.pc-ts-up.log 2>/dev/null | tr '\n' ' ')"
+  dbg "tailscale not ready yet, up output: $(head -3 /tmp/.pc-ts-up.log 2>/dev/null | tr '\n' ' ')"
   return 1
 }
 
@@ -325,8 +369,8 @@ probe_one() {
   # 局域网要么秒通要么就是不在同一个网，等久了没意义
   [ "$r" = "lan" ] && ct=3
   build_route "$r" "$ct" || return 1
-  timeout "$PROBE_TIMEOUT" ssh "${SSHOPTS[@]}" -p "$PC_PORT" -o BatchMode=yes \
-    "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "exit 0" >/dev/null 2>&1
+  timeout "$PROBE_TIMEOUT" ssh "${SSHOPTS[@]}" -n -p "$PC_PORT" -o BatchMode=yes \
+    "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "exit 0" </dev/null >/dev/null 2>&1
   local rc=$?
   # 记下本次网络下局域网探测的结果，失败的网络下次直接跳过，不再白等 3 秒
   if [ "$r" = "lan" ]; then
@@ -340,31 +384,31 @@ probe_one() {
   return "$rc"
 }
 
-# 并行探测，结果按 $ORDER 的优先级写入 WINNERS
+# 实时全路并发竞速：按实际握手完成先后写入 WINNERS，不用历史缓存排序
 probe_all() {
-  local r pid i
+  local r pid
   local -a pids=()
   local PDIR
   PDIR=$(mktemp -d /tmp/.pcprobe.XXXXXX) || return 1
 
-  # 局域网单独先试：通了就不必再拉起 tailscaled，也不会被并行探测的提前退出误杀
+  # 局域网单独先试：同网段 1ms 直连，通了就不必再拉起 tailscaled
   local todo="$ROUTES"
   case " $ROUTES " in
     *" lan "*)
       if probe_one lan; then
-        dbg "探测通过: lan"
+        dbg "probe passed: lan"
         WINNERS="lan"
         rm -rf "$PDIR"
         return 0
       fi
-      dbg "探测失败: lan"
+      dbg "probe failed: lan"
       todo=$(echo "$ROUTES" | tr ' ' '\n' | grep -v '^lan$' | tr '\n' ' ')
       ;;
   esac
   [ -n "${todo// /}" ] || { rm -rf "$PDIR"; WINNERS=""; return 1; }
 
   for r in $todo; do
-    ( probe_one "$r" && : > "$PDIR/$r" ) &
+    ( probe_one "$r" && printf '%s\n' "$r" >> "$PDIR/winners.list" ) &
     pids+=($!)
   done
 
@@ -372,27 +416,31 @@ probe_all() {
   while [ "$remaining" -gt 0 ]; do
     wait -n 2>/dev/null || true
     remaining=$((remaining - 1))
-    for r in $ROUTES; do
-      [ -f "$PDIR/$r" ] && hit=1
-    done
-    [ "$hit" -eq 1 ] && break
-  done
-
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
-  wait 2>/dev/null || true
-
-  WINNERS=""
-  for r in $ORDER; do
-    [ "$r" = "lan" ] && continue
-    if [ -f "$PDIR/$r" ]; then
-      WINNERS="$WINNERS $r"
-      dbg "探测通过: $r"
-    else
-      dbg "探测失败: $r"
+    if [ -s "$PDIR/winners.list" ]; then
+      hit=1
+      break
     fi
   done
+
+  # 首个赢家出现后给 0.35s 宽限期，顺便收下已经几乎同时握完手的备选快路
+  local grace="${1:-0.35}"
+  if [ "$hit" -eq 1 ] && [ "$remaining" -gt 0 ]; then
+    sleep "$grace"
+  fi
+
+  for pid in "${pids[@]}"; do
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
+  wait "${pids[@]}" 2>/dev/null || true
+
+  WINNERS=""
+  if [ -s "$PDIR/winners.list" ]; then
+    WINNERS=$(awk '!seen[$0]++' "$PDIR/winners.list" | tr '\n' ' ')
+  fi
+  for r in $WINNERS; do dbg "race winner: $r"; done
   rm -rf "$PDIR"
-  [ -n "$WINNERS" ]
+  [ "$hit" -eq 1 ]
 }
 
 # ---------- 主流程 ----------
@@ -435,34 +483,49 @@ need_learn() {
 # detect_routes 在命令替换里跑，LAN_HOST 必须在主 shell 先算好再传进去
 LAN_HOST=$(lan_candidate) || LAN_HOST=""
 ROUTES=$(detect_routes)
-ORDER="$ROUTES"
-
-if [ -s "$PC_CACHE" ]; then
-  CFP=""; CROUTE=""
-  read -r CFP CROUTE < "$PC_CACHE" 2>/dev/null || true
-  if [ -n "$CFP" ] && [ "$CFP" = "$FP" ] && [ -n "$CROUTE" ] \
-     && echo " $ROUTES " | grep -q " $CROUTE "; then
-    ORDER="$CROUTE $(echo "$ROUTES" | tr ' ' '\n' | grep -v "^$CROUTE$" | tr '\n' ' ')"
-  fi
-fi
-
-# 局域网只要可用就排第一：同网段直连一定比任何隧道都快，不必参考缓存
-case " $ORDER " in
-  *" lan "*)
-    ORDER="lan $(echo "$ORDER" | tr ' ' '\n' | grep -v '^lan$' | tr '\n' ' ')" ;;
-esac
-dbg "routes=[$ROUTES] order=[$ORDER]"
+dbg "routes=[$ROUTES]"
 
 if [ -z "$ROUTES" ]; then
-  echo "pc: 当前没有可用路由（检查 Tailscale 是否在线、是否有公网 IPv6）" >&2
+  echo "pc: no candidate routes available (check Tailscale or global IPv6)" >&2
   exit 255
 fi
 
+start_ticker
 WINNERS=""
 if ! probe_all; then
-  echo "pc: 所有路由都不通（试过: $(echo "$ROUTES" | xargs)）" >&2
+  # 拿锁后再决定是否重启 tailscaled，避免并发 pc 调用互相误杀
+  exec 9>"$PC_TS_BASE/run/pc-ts.lock"
+  if flock -w 40 9; then
+    if ! ts_port_alive && pgrep -x tailscaled >/dev/null 2>&1 \
+       && ! pgrep -f "ssh.*$PC_TS_IP|tailscale.* nc |ProxyCommand=ts-" >/dev/null 2>&1; then
+      dbg "all probes failed, restarting tailscaled and retrying"
+      pkill -x tailscaled 2>/dev/null
+      sleep 0.5
+      pkill -9 -x tailscaled 2>/dev/null
+      rm -f "$TS_SOCK"
+    fi
+    exec 9>&-
+    ensure_ts >/dev/null 2>&1 && probe_all
+  else
+    exec 9>&-
+  fi
+fi
+if [ -z "$WINNERS" ]; then
+  echo "pc: all routes unreachable (tried: $(echo "$ROUTES" | xargs))" >&2
   exit 255
 fi
+
+# 全部路径均断线时的全路径自愈与重竞速：重新探测网卡/路由、拉起 tailscaled、放宽宽限期收齐备选路由
+heal_and_rerace() {
+  dbg "all selected routes dropped, healing and re-racing"
+  FP=$(env_fp)
+  LAN_HOST=$(lan_candidate) || LAN_HOST=""
+  ensure_ts >/dev/null 2>&1 || true
+  ROUTES=$(detect_routes)
+  [ -n "$ROUTES" ] || return 1
+  WINNERS=""
+  probe_all 1.0
+}
 
 # pc --scp "F:\路径\文件" [本地路径]：走赢家那条路把文件拉下来，成功后打印本地路径
 if [ "$MODE" = "scp" ]; then
@@ -471,42 +534,75 @@ if [ "$MODE" = "scp" ]; then
   case "$RP" in /*) ;; *) RP="/$RP" ;; esac
   LP=${2:-${PC_INBOX:-$HOME/inbox}/$(basename "$RP")}
   mkdir -p "$(dirname "$LP")" || exit 1
-  for R in $WINNERS; do
-    build_route "$R" "$CONN_CT" || continue
-    scp -q -P "$PC_PORT" -o StrictHostKeyChecking=accept-new "${ROUTE_OPTS[@]}" \
-      "$ROUTE_SCP_TARGET:$RP" "$LP"
-    RC=$?
-    if [ "$RC" -eq 0 ]; then
-      echo "$FP $R" > "$PC_CACHE"
-      if [ "$R" != "lan" ] && need_learn; then
-        nohup "$0" --learn-lan "$R" >/dev/null 2>&1 &
+  local_try_scp() {
+    local r elapsed
+    for r in $WINNERS; do
+      build_route "$r" "$CONN_CT" || continue
+      stop_ticker
+      elapsed=$(( $(date +%s) - PC_START_TS ))
+      dbg "selected $r (${elapsed}s), transferring file..."
+      scp -q -P "$PC_PORT" -o StrictHostKeyChecking=accept-new "${ROUTE_OPTS[@]}" \
+        "$ROUTE_SCP_TARGET:$RP" "$LP"
+      if [ $? -eq 0 ]; then
+        PC_CONNECTED=1
+        dbg "transfer complete ($r, ${elapsed}s)"
+        if [ "$r" != "lan" ] && need_learn; then
+          nohup "$0" --learn-lan "$r" >/dev/null 2>&1 &
+        fi
+        echo "$LP"
+        return 0
       fi
-      echo "$LP"
-      exit 0
-    fi
-    echo "pc: 走 $R 拉文件失败，换下一条" >&2
-  done
-  echo "pc: 拉取失败（试过: $(echo "$WINNERS" | xargs)）" >&2
+      echo "pc: scp via $r failed, trying next" >&2
+      start_ticker
+    done
+    return 1
+  }
+  local_try_scp && exit 0
+  if heal_and_rerace; then
+    local_try_scp && exit 0
+  fi
+  echo "pc: scp failed after heal & re-race (tried: $(echo "$WINNERS" | xargs))" >&2
   exit 255
 fi
 
-for R in $WINNERS; do
-  build_route "$R" "$CONN_CT" || continue
-  if [ $# -gt 0 ]; then
-    ssh "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "$@"
-  else
-    ssh -t "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET"
-  fi
-  RC=$?
-  if [ "$RC" -ne 255 ]; then
-    echo "$FP $R" > "$PC_CACHE"
-    if [ "$R" != "lan" ] && need_learn; then
-      nohup "$0" --learn-lan "$R" >/dev/null 2>&1 &
+local_try_ssh() {
+  local r rc elapsed
+  for r in $WINNERS; do
+    build_route "$r" "$CONN_CT" || continue
+    stop_ticker
+    elapsed=$(( $(date +%s) - PC_START_TS ))
+    dbg "connected via $r (${elapsed}s)"
+    PC_CONNECTED=1
+    if [ $# -gt 0 ]; then
+      ssh "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET" "$@"
+    else
+      ssh -t "${SSHOPTS[@]}" -p "$PC_PORT" "${ROUTE_OPTS[@]}" "$ROUTE_TARGET"
     fi
-    exit "$RC"
-  fi
-  echo "pc: 走 $R 断了，换下一条" >&2
-done
+    rc=$?
+    if [ "$rc" -ne 255 ]; then
+      if [ "$r" != "lan" ] && need_learn; then
+        nohup "$0" --learn-lan "$r" >/dev/null 2>&1 &
+      fi
+      return "$rc"
+    fi
+    PC_CONNECTED=0
+    echo "pc: route $r dropped, trying next" >&2
+    start_ticker
+  done
+  return 255
+}
 
-echo "pc: 所有可用路径都失败了" >&2
+local_try_ssh "$@"
+RC=$?
+if [ "$RC" -eq 255 ]; then
+  if heal_and_rerace; then
+    local_try_ssh "$@"
+    RC=$?
+  fi
+fi
+if [ "$RC" -ne 255 ]; then
+  exit "$RC"
+fi
+
+echo "pc: all routes failed after heal & re-race" >&2
 exit 255
